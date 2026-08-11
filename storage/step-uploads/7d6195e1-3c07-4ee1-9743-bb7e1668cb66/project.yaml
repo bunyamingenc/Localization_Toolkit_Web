@@ -1,0 +1,14 @@
+expected_encoding: utf-8
+expected_eol: LF
+bom_policy: forbid
+dry_run: true
+source_locale: en
+locales:
+  - tr-TR
+  - de-DE
+  - fr-FR
+  - ja-JP
+naming_convention: "{basename}.{locale}.{ext}"
+rainbow_path: "C:\\Users\\BENJAMIN\\Desktop\\Okapi_Rainbow\\rainbow.exe"
+qa:
+  fail_on: error

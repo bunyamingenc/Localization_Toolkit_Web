@@ -1,0 +1,9 @@
+node_modules/
+uploads/
+storage/*.db
+storage/*.db-*
+storage/projects/
+storage/step-uploads/
+.env
+*.log
+.DS_Store

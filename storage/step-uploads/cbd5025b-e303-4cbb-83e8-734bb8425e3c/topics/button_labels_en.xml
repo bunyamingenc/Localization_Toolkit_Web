@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    button_labels_en.xml - Button Labels Localization
+    This file contains translations for button label messages.
+
+    Note: Do not translate placeholders or inline code.
+-->
+
+<resources>
+    <string name="button_save">Save Changes</string>
+    <string name="button_cancel">Cancel</string>
+    <string name="button_submit">Submit</string>
+    <string name="button_delete">Delete {object.name}</string>
+    <string name="button_update">Update {item.type}</string>
+    <string name="button_send">Send Message</string>
+    <string name="button_confirm">Confirm Action</string>
+    <string name="button_view">View Details</string>
+    <string name="button_edit">Edit {item.type}</string>
+    <string name="button_add">Add {item.type}</string>
+    <string name="button_remove">Remove {item.type}</string>
+    <string name="button_accept">Accept {request.type}</string>
+    <string name="button_reject">Reject {request.type}</string>
+    <string name="button_download">Download {file.name}</string>
+    <string name="button_upload">Upload {file.type}</string>
+    <string name="button_confirm_changes">Confirm Changes</string>
+    <string name="button_dismiss">Dismiss</string>
+    <string name="button_done">Done</string>
+    <string name="button_start">Start {process.name}</string>
+    <string name="button_pause">Pause {process.name}</string>
+</resources>

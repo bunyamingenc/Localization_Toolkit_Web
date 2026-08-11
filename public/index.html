@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Loc Toolkit — Web</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <div class="sidebar">
+      <h3 id="homeLink" style="cursor:pointer">Loc Toolkit <span class="badge-web">web</span></h3>
+
+      <button class="primary" id="newProjectBtn" style="margin-top:12px">+ New project</button>
+
+      <div id="projectsListBox" style="margin-top:20px">
+        <button id="projectsToggle" style="width:100%;text-align:left;display:flex;align-items:center;gap:8px;background:transparent;border:none;cursor:pointer;padding:4px 0">
+          <h4 style="font-size:13px;margin:0">Projects</h4>
+          <span id="projectsChevron" style="margin-left:auto;font-size:11px;color:#5f5e5a">▲</span>
+        </button>
+        <div id="projectsList"></div>
+      </div>
+
+      <div id="statusBox" class="status-box" style="display:none">
+        <span class="badge" id="runStatus">pending</span>
+        <p class="log-line" id="runId"></p>
+      </div>
+    </div>
+
+    <div class="main" id="mainPanel">
+      <h2>Welcome</h2>
+      <p class="log-line">Pick a project on the left, or click "+ New project" to upload one.</p>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

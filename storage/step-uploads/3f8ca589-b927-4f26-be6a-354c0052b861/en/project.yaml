@@ -1,0 +1,22 @@
+# Copy this file into your project folder as project.yaml and adjust.
+
+expected_encoding: utf-8
+expected_eol: LF # LF | CRLF | CR
+bom_policy: forbid # forbid | require | ignore
+dry_run:
+  true
+  # every writing step (renamer, locale creation) must honor this
+source_locale: en
+locales:
+  - tr-TR
+  - de-DE
+  - fr-FR
+  - ja-JP
+
+glossary_path: null # path to a TBX/CSV termbase, once the QA rule exists
+
+naming_convention: "{basename}.{locale}.{ext}"
+rainbow_path: "C:\\Users\\BENJAMIN\\Desktop\\Okapi_Rainbow\\rainbow.exe"
+
+qa:
+  fail_on: error # error | warning — controls the CLI/CI exit code threshold
