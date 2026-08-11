@@ -2,9 +2,12 @@ const express = require("express");
 const path = require("path");
 const projectRoutes = require("./routes/projects");
 const runRoutes = require("./routes/runs");
+const { apiKeyAuth } = require("./middleware/apiKeyAuth");
+const { runCleanup } = require("./lib/cleanup");
 
 const app = express();
 app.use(express.json());
+app.use(apiKeyAuth); // no-op unless API_KEY env var is set
 app.use(express.static(path.join(__dirname, "../public")));
 
 app.use("/projects", projectRoutes);
@@ -16,3 +19,12 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Loc Toolkit API listening on http://localhost:${PORT}`);
 });
+
+// Expired projects and stray upload folders are cleaned up automatically —
+// once on startup, then on a recurring interval. Configurable via env vars
+// so a deployment can tune retention without a code change.
+const CLEANUP_MAX_AGE_HOURS = Number(process.env.CLEANUP_MAX_AGE_HOURS || 24);
+const CLEANUP_INTERVAL_MINUTES = Number(process.env.CLEANUP_INTERVAL_MINUTES || 60);
+
+runCleanup(CLEANUP_MAX_AGE_HOURS);
+setInterval(() => runCleanup(CLEANUP_MAX_AGE_HOURS), CLEANUP_INTERVAL_MINUTES * 60 * 1000);

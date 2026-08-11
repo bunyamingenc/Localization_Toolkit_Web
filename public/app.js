@@ -7,6 +7,25 @@ let currentProjectId = null;
 let currentRunId = null;
 let triggerRainbowGenerate = null; // set by buildRainbowFixCard, called automatically after output QA finds errors
 
+// Wraps fetch to attach a saved API key (if the deployment has one set via
+// API_KEY) and prompt for it on first 401. No-op for local dev where no
+// key is configured — the header is just absent and the server ignores it.
+async function apiFetch(url, options = {}) {
+  const key = localStorage.getItem("loc_toolkit_api_key");
+  const headers = { ...(options.headers || {}) };
+  if (key) headers["x-api-key"] = key;
+
+  let res = await fetch(url, { ...options, headers });
+  if (res.status === 401) {
+    const entered = prompt("This deployment requires an API key. Enter it to continue:");
+    if (entered) {
+      localStorage.setItem("loc_toolkit_api_key", entered);
+      res = await fetch(url, { ...options, headers: { ...headers, "x-api-key": entered } });
+    }
+  }
+  return res;
+}
+
 const statusBox = document.getElementById("statusBox");
 const runStatusEl = document.getElementById("runStatus");
 const runIdEl = document.getElementById("runId");
@@ -19,7 +38,7 @@ const homeLink = document.getElementById("homeLink");
 
 // ── Navigation: projects list, project detail, run dashboard ───────────
 async function loadProjectsList() {
-  const res = await fetch("/projects");
+  const res = await apiFetch("/projects");
   const projects = await res.json();
   projectsListEl.innerHTML = "";
 
@@ -44,7 +63,7 @@ async function loadProjectsList() {
     item.querySelector(".proj-delete").addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!confirm(`Delete project "${p.name}"? This cannot be undone.`)) return;
-      await fetch(`/projects/${p.id}`, { method: "DELETE" });
+      await apiFetch(`/projects/${p.id}`, { method: "DELETE" });
       if (currentProjectId === p.id) goHome();
       loadProjectsList();
     });
@@ -85,7 +104,7 @@ async function openProject(project) {
   statusBox.style.display = "none";
 
   mainPanel.innerHTML = `<p class="log-line"><span class="spinner"></span>Loading…</p>`;
-  const res = await fetch(`/projects/${project.id}/runs`);
+  const res = await apiFetch(`/projects/${project.id}/runs`);
   const runs = await res.json();
 
   mainPanel.innerHTML = "";
@@ -124,7 +143,7 @@ async function openProject(project) {
 
 async function startNewRun(project) {
   mainPanel.innerHTML = `<h2>Starting run…</h2><p class="log-line"><span class="spinner"></span>Setting things up.</p>`;
-  const res = await fetch(`/projects/${project.id}/runs`, { method: "POST" });
+  const res = await apiFetch(`/projects/${project.id}/runs`, { method: "POST" });
   const run = await res.json();
   if (!res.ok) {
     mainPanel.innerHTML = `<h2 style="color:#791f1f">Error</h2><p class="log-line">${escapeHtml(run.error || "Could not start run")}</p>`;
@@ -142,7 +161,7 @@ async function openRun(runId) {
   statusBox.style.display = "block";
   runIdEl.textContent = `Run ${runId.slice(0, 8)}`;
 
-  const res = await fetch(`/runs/${runId}`);
+  const res = await apiFetch(`/runs/${runId}`);
   const run = await res.json();
   if (!res.ok) {
     mainPanel.innerHTML = `<h2 style="color:#791f1f">Error</h2><p class="log-line">${escapeHtml(run.error || "Run not found")}</p>`;
@@ -308,12 +327,12 @@ function renderNewProjectView() {
       form.append("file", selectedFile);
       form.append("name", projectNameInput.value.trim() || selectedFile.name.replace(/\.zip$/i, ""));
 
-      const projectRes = await fetch("/projects", { method: "POST", body: form });
+      const projectRes = await apiFetch("/projects", { method: "POST", body: form });
       const project = await projectRes.json();
       if (!projectRes.ok) throw new Error(project.error || "Upload failed");
       currentProjectId = project.id;
 
-      const runRes = await fetch(`/projects/${project.id}/runs`, { method: "POST" });
+      const runRes = await apiFetch(`/projects/${project.id}/runs`, { method: "POST" });
       const run = await runRes.json();
       if (!runRes.ok) throw new Error(run.error || "Could not start run");
       currentRunId = run.runId;
@@ -337,7 +356,7 @@ function renderNewProjectView() {
 function pollRun(runId) {
   clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
-    const res = await fetch(`/runs/${runId}`);
+    const res = await apiFetch(`/runs/${runId}`);
     const run = await res.json();
     if (!res.ok) return;
 
@@ -358,7 +377,7 @@ function renderRun(run) {
   mainPanel.innerHTML = `<a href="#" id="backToProjectLink" class="log-line" style="color:#185fa5">← Back to project</a><h2>Run ${run.id.slice(0, 8)} — ${run.status}</h2>`;
   document.getElementById("backToProjectLink").onclick = async (e) => {
     e.preventDefault();
-    const res = await fetch(`/projects/${currentProjectId}`);
+    const res = await apiFetch(`/projects/${currentProjectId}`);
     const project = await res.json();
     if (res.ok) openProject(project);
   };
@@ -741,7 +760,7 @@ function buildCatImportCard() {
     const locales = card.querySelector("#catTargetLocales").value.split(",").map(s => s.trim()).filter(Boolean);
     const resBox = card.querySelector("#catResult");
 
-    const res = await fetch(`/runs/${currentRunId}/steps/cat-import`, {
+    const res = await apiFetch(`/runs/${currentRunId}/steps/cat-import`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sourceLocale, locales })
@@ -755,7 +774,7 @@ function buildCatImportCard() {
   };
 
   card.querySelector("#catSkipBtn").onclick = async () => {
-    await fetch(`/runs/${currentRunId}/steps/cat_import/skip`, { method: "POST" });
+    await apiFetch(`/runs/${currentRunId}/steps/cat_import/skip`, { method: "POST" });
     card.querySelector("#catBadge").textContent = "skipped";
     card.querySelector("#catBadge").className = "badge";
     card.querySelector("#catResult").innerHTML = `<p class="log-line">Step skipped.</p>`;
@@ -821,7 +840,7 @@ function buildRenamerCard() {
       const zipBlob = await zipFileListToBlob(renFolderInput.files);
       const form = new FormData();
       form.append("file", zipBlob, "root-upload.zip");
-      const res = await fetch(`/runs/${currentRunId}/steps/renamer/upload-root`, { method: "POST", body: form });
+      const res = await apiFetch(`/runs/${currentRunId}/steps/renamer/upload-root`, { method: "POST", body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Upload failed");
       renRootPath = data.path;
@@ -898,7 +917,7 @@ function buildRenamerCard() {
     const resBox = card.querySelector("#renResult");
     if (!triggerBtn) resBox.innerHTML = `<p class="log-line"><span class="spinner"></span>Scanning…</p>`;
 
-    const res = await fetch(`/runs/${currentRunId}/steps/renamer${endpoint}`, {
+    const res = await apiFetch(`/runs/${currentRunId}/steps/renamer${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(getParams())
@@ -913,7 +932,7 @@ function buildRenamerCard() {
 
   card.querySelector("#renPreviewBtn").onclick = () => runRenamer("/preview");
   card.querySelector("#renSkipBtn").onclick = async () => {
-    await fetch(`/runs/${currentRunId}/steps/renamer/skip`, { method: "POST" });
+    await apiFetch(`/runs/${currentRunId}/steps/renamer/skip`, { method: "POST" });
     card.querySelector("#renBadge").textContent = "skipped";
     card.querySelector("#renBadge").className = "badge";
     card.querySelector("#renResult").innerHTML = `<p class="log-line">Step skipped.</p>`;
@@ -968,7 +987,7 @@ function buildOutputQaCard() {
       const zipBlob = await zipFileListToBlob(fileList);
       const form = new FormData();
       form.append("file", zipBlob, `${label}.zip`);
-      const res = await fetch(`/runs/${currentRunId}/steps/output-qa/${endpoint}`, { method: "POST", body: form });
+      const res = await apiFetch(`/runs/${currentRunId}/steps/output-qa/${endpoint}`, { method: "POST", body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Upload failed");
       statusEl.textContent = `✓ ${fileList.length} file(s) uploaded`;
@@ -989,7 +1008,7 @@ function buildOutputQaCard() {
     const resBox = card.querySelector("#qaResult");
     resBox.innerHTML = `<p class="log-line"><span class="spinner"></span>Scanning…</p>`;
 
-    const res = await fetch(`/runs/${currentRunId}/steps/output-qa/run`, { method: "POST" });
+    const res = await apiFetch(`/runs/${currentRunId}/steps/output-qa/run`, { method: "POST" });
     const data = await res.json();
     if (!res.ok) { resBox.innerHTML = `<p class="log-line" style="color:#791f1f">${escapeHtml(data.error || "Failed")}</p>`; return; }
 
@@ -1008,7 +1027,7 @@ function buildOutputQaCard() {
   };
 
   card.querySelector("#qaSkipBtn").onclick = async () => {
-    await fetch(`/runs/${currentRunId}/steps/output_encoding_qa/skip`, { method: "POST" });
+    await apiFetch(`/runs/${currentRunId}/steps/output_encoding_qa/skip`, { method: "POST" });
     card.querySelector("#qaBadge").textContent = "skipped";
     card.querySelector("#qaBadge").className = "badge";
     card.querySelector("#qaResult").innerHTML = `<p class="log-line">Step skipped.</p>`;
@@ -1137,7 +1156,7 @@ function buildRainbowFixCard() {
     const resBox = card.querySelector("#rnbResult");
     resBox.innerHTML = `<p class="log-line"><span class="spinner"></span>Detecting problematic files…</p>`;
 
-    const res = await fetch(`/runs/${currentRunId}/steps/rainbow-fix/generate`, {
+    const res = await apiFetch(`/runs/${currentRunId}/steps/rainbow-fix/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ localRoot })
@@ -1155,7 +1174,7 @@ function buildRainbowFixCard() {
   triggerRainbowGenerate = generateProject; // exposed so Output QA can call this automatically
 
   card.querySelector("#rnbSkipBtn").onclick = async () => {
-    await fetch(`/runs/${currentRunId}/steps/rainbow_fix/skip`, { method: "POST" });
+    await apiFetch(`/runs/${currentRunId}/steps/rainbow_fix/skip`, { method: "POST" });
     card.querySelector("#rnbBadge").textContent = "skipped";
     card.querySelector("#rnbBadge").className = "badge";
     card.querySelector("#rnbResult").innerHTML = `<p class="log-line">Step skipped.</p>`;
