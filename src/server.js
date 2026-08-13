@@ -26,5 +26,7 @@ app.listen(PORT, () => {
 const CLEANUP_MAX_AGE_HOURS = Number(process.env.CLEANUP_MAX_AGE_HOURS || 24);
 const CLEANUP_INTERVAL_MINUTES = Number(process.env.CLEANUP_INTERVAL_MINUTES || 60);
 
-runCleanup(CLEANUP_MAX_AGE_HOURS);
-setInterval(() => runCleanup(CLEANUP_MAX_AGE_HOURS), CLEANUP_INTERVAL_MINUTES * 60 * 1000);
+runCleanup(CLEANUP_MAX_AGE_HOURS).catch((err) => console.error("[cleanup] failed:", err.message));
+setInterval(() => {
+  runCleanup(CLEANUP_MAX_AGE_HOURS).catch((err) => console.error("[cleanup] failed:", err.message));
+}, CLEANUP_INTERVAL_MINUTES * 60 * 1000);

@@ -4,6 +4,7 @@ storage/*.db
 storage/*.db-*
 storage/projects/
 storage/step-uploads/
+storage/scratch/
 .env
 *.log
 .DS_Store

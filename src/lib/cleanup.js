@@ -2,7 +2,6 @@ const fs = require("fs");
 const path = require("path");
 const db = require("../db/db");
 
-const PROJECTS_ROOT = path.join(__dirname, "../../storage/projects");
 const STEP_UPLOADS_ROOT = path.join(__dirname, "../../storage/step-uploads");
 const TMP_UPLOADS_ROOT = path.join(__dirname, "../../uploads");
 
@@ -11,21 +10,25 @@ const TMP_UPLOADS_ROOT = path.join(__dirname, "../../uploads");
  * plus any orphaned step-upload folders and stray temp upload files.
  * Called on server startup and on a recurring interval — see server.js.
  */
-function runCleanup(maxAgeHours) {
-  const cutoff = Date.now() - maxAgeHours * 60 * 60 * 1000;
+async function runCleanup(maxAgeHours) {
+  const cutoffMs = Date.now() - maxAgeHours * 60 * 60 * 1000;
+  // ISO string comparison works correctly on both backends: SQLite stores
+  // created_at as TEXT (lexicographic order = chronological order for
+  // ISO8601), and Postgres's TIMESTAMP column compares an ISO string fine
+  // without needing a database-specific function like SQLite's datetime().
+  const cutoffIso = new Date(cutoffMs).toISOString();
   let deletedProjects = 0, deletedStepUploads = 0, deletedTmpFiles = 0;
 
   // 1. Expired projects — remove DB rows and their files together, so we
   // never end up with a project row pointing at a folder that no longer exists.
-  const oldProjects = db.prepare("SELECT * FROM projects WHERE created_at < datetime(?, 'unixepoch')").all(Math.floor(cutoff / 1000));
+  const oldProjects = await db.all("SELECT * FROM projects WHERE created_at < ?", [cutoffIso]);
   for (const project of oldProjects) {
-    const runIds = db.prepare("SELECT id FROM runs WHERE project_id = ?").all(project.id).map(r => r.id);
-    for (const runId of runIds) {
-      db.prepare("DELETE FROM step_logs WHERE step_id IN (SELECT id FROM steps WHERE run_id = ?)").run(runId);
-      db.prepare("DELETE FROM steps WHERE run_id = ?").run(runId);
+    const runs = await db.all("SELECT id FROM runs WHERE project_id = ?", [project.id]);
+    for (const run of runs) {
+      await db.run("DELETE FROM steps WHERE run_id = ?", [run.id]);
     }
-    db.prepare("DELETE FROM runs WHERE project_id = ?").run(project.id);
-    db.prepare("DELETE FROM projects WHERE id = ?").run(project.id);
+    await db.run("DELETE FROM runs WHERE project_id = ?", [project.id]);
+    await db.run("DELETE FROM projects WHERE id = ?", [project.id]);
 
     if (fs.existsSync(project.storage_path)) {
       fs.rmSync(project.storage_path, { recursive: true, force: true });
@@ -40,7 +43,7 @@ function runCleanup(maxAgeHours) {
       const full = path.join(STEP_UPLOADS_ROOT, entry);
       try {
         const stat = fs.statSync(full);
-        if (stat.mtimeMs < cutoff) {
+        if (stat.mtimeMs < cutoffMs) {
           fs.rmSync(full, { recursive: true, force: true });
           deletedStepUploads++;
         }
@@ -56,7 +59,7 @@ function runCleanup(maxAgeHours) {
       const full = path.join(TMP_UPLOADS_ROOT, entry);
       try {
         const stat = fs.statSync(full);
-        if (stat.mtimeMs < cutoff) {
+        if (stat.mtimeMs < cutoffMs) {
           fs.rmSync(full, { force: true });
           deletedTmpFiles++;
         }

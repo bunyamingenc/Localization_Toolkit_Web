@@ -6,129 +6,98 @@ const multer = require("multer");
 const { safeExtract } = require("../lib/safeExtract");
 const { v4: uuid } = require("uuid");
 const db = require("../db/db");
-const inventory = require("../steps/inventory");
-const encodingQA = require("../steps/encodingQA");
-const placeholderAnalysis = require("../steps/placeholderAnalysis");
+const { createPendingSteps } = require("../lib/pipelineRunner");
+const { enqueueRun } = require("../lib/queue");
+const { isS3Reference, materializeToLocal } = require("../lib/storage");
 const renamer = require("../steps/renamer");
 const outputEncodingQA = require("../steps/outputEncodingQA");
 const rainbowFix = require("../steps/rainbowFix");
 const { LOCALE_FORMATS } = require("../steps/localeFormats");
 
 const router = express.Router();
+const now = () => new Date().toISOString();
 
 // Separate storage tree for step-scoped uploads — e.g. the translated
 // files a user gets back from Trados, which are a distinct deliverable
 // from the original source project uploaded at the start.
 const STEP_UPLOADS_ROOT = path.join(__dirname, "../../storage/step-uploads");
+const SCRATCH_ROOT = path.join(__dirname, "../../storage/scratch");
 fs.mkdirSync(STEP_UPLOADS_ROOT, { recursive: true });
 const MAX_UPLOAD_BYTES = 300 * 1024 * 1024; // 300MB
 const stepUpload = multer({ dest: path.join(__dirname, "../../uploads"), limits: { fileSize: MAX_UPLOAD_BYTES } });
 
-// Pipeline order — matches desktop app: inventory -> encoding QA -> placeholder analysis
-const PIPELINE = ["inventory", "encoding_qa", "placeholder_analysis"];
-
-const STEP_RUNNERS = {
-  inventory: (project) => inventory.run(project.storage_path),
-  encoding_qa: (project) => encodingQA.run(project.storage_path),
-  placeholder_analysis: (project) => placeholderAnalysis.run(project.storage_path),
-};
-
 // POST /projects/:projectId/runs — start a new run (returns immediately, work happens async)
-router.post("/projects/:projectId/runs", (req, res) => {
-  const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(req.params.projectId);
+router.post("/projects/:projectId/runs", async (req, res) => {
+  const project = await db.get("SELECT * FROM projects WHERE id = ?", [req.params.projectId]);
   if (!project) return res.status(404).json({ error: "Project not found" });
 
   const runId = uuid();
-  db.prepare("INSERT INTO runs (id, project_id, status) VALUES (?, ?, 'running')").run(runId, project.id);
-
-  for (const stepKey of PIPELINE) {
-    db.prepare("INSERT INTO steps (id, run_id, step_key, status) VALUES (?, ?, ?, 'pending')")
-      .run(uuid(), runId, stepKey);
-  }
+  await db.run("INSERT INTO runs (id, project_id, status) VALUES (?, ?, 'running')", [runId, project.id]);
+  await createPendingSteps(runId, uuid);
 
   res.status(202).json({ runId, status: "running" });
 
-  processRun(runId, project).catch((err) => {
-    db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(runId);
-    console.error(`[run ${runId}] failed:`, err.message);
+  enqueueRun(runId, project).catch(async (err) => {
+    await db.run("UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ?", [now(), runId]);
+    console.error(`[run ${runId}] failed to enqueue:`, err.message);
   });
 });
 
-async function processRun(runId, project) {
-  // ORDER BY rowid — steps.id is a UUID (TEXT), so ORDER BY id sorts
-  // alphabetically, not by insertion order. rowid is SQLite's implicit
-  // auto-incrementing column and always reflects insertion order.
-  const steps = db.prepare("SELECT * FROM steps WHERE run_id = ? ORDER BY rowid").all(runId);
-
-  for (const step of steps) {
-    db.prepare("UPDATE steps SET status = 'running', started_at = datetime('now') WHERE id = ?").run(step.id);
-    try {
-      const result = await STEP_RUNNERS[step.step_key](project);
-      db.prepare("UPDATE steps SET status = 'done', result_json = ?, finished_at = datetime('now') WHERE id = ?")
-        .run(JSON.stringify(result), step.id);
-    } catch (err) {
-      db.prepare("UPDATE steps SET status = 'failed', result_json = ?, finished_at = datetime('now') WHERE id = ?")
-        .run(JSON.stringify({ error: err.message }), step.id);
-      db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(runId);
-      return;
-    }
-  }
-
-  db.prepare("UPDATE runs SET status = 'done', updated_at = datetime('now') WHERE id = ?").run(runId);
-}
-
 // GET /runs/:id — poll for status + all step results
-router.get("/runs/:id", (req, res) => {
-  const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(req.params.id);
+router.get("/runs/:id", async (req, res) => {
+  const run = await db.get("SELECT * FROM runs WHERE id = ?", [req.params.id]);
   if (!run) return res.status(404).json({ error: "Run not found" });
 
-  const steps = db.prepare("SELECT * FROM steps WHERE run_id = ? ORDER BY rowid").all(run.id)
-    .map((s) => ({ ...s, result: s.result_json ? JSON.parse(s.result_json) : null }));
+  const orderCol = db.usingPostgres ? "seq" : "rowid";
+  const rawSteps = await db.all(`SELECT * FROM steps WHERE run_id = ? ORDER BY ${orderCol}`, [run.id]);
+  const steps = rawSteps.map((s) => ({ ...s, result: s.result_json ? JSON.parse(s.result_json) : null }));
 
   res.json({ ...run, steps });
 });
 
-// Insert-or-update a single step row synchronously and return its id.
-// Used by the interactive steps below, which run on-demand rather than as
-// part of the automatic pipeline.
-function upsertStep(runId, stepKey, status, resultJson) {
-  const existing = db.prepare("SELECT id FROM steps WHERE run_id = ? AND step_key = ?").get(runId, stepKey);
+// Insert-or-update a single step row and return its id. Used by the
+// interactive steps below, which run on-demand rather than as part of
+// the automatic pipeline.
+async function upsertStep(runId, stepKey, status, resultJson) {
+  const existing = await db.get("SELECT id FROM steps WHERE run_id = ? AND step_key = ?", [runId, stepKey]);
   if (existing) {
-    db.prepare("UPDATE steps SET status = ?, result_json = ?, finished_at = datetime('now') WHERE id = ?")
-      .run(status, resultJson, existing.id);
+    await db.run("UPDATE steps SET status = ?, result_json = ?, finished_at = ? WHERE id = ?", [status, resultJson, now(), existing.id]);
     return existing.id;
   }
   const id = uuid();
-  db.prepare("INSERT INTO steps (id, run_id, step_key, status, result_json, started_at, finished_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))")
-    .run(id, runId, stepKey, status, resultJson);
+  await db.run(
+    "INSERT INTO steps (id, run_id, step_key, status, result_json, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [id, runId, stepKey, status, resultJson, now(), now()]
+  );
   return id;
 }
 
 // Like upsertStep, but merges into any existing result_json instead of
 // overwriting it — needed here because output QA collects two independent
 // uploads (output folder, then optionally source folder) before running.
-function mergeStepResult(runId, stepKey, status, patch) {
-  const existing = db.prepare("SELECT id, result_json FROM steps WHERE run_id = ? AND step_key = ?").get(runId, stepKey);
+async function mergeStepResult(runId, stepKey, status, patch) {
+  const existing = await db.get("SELECT id, result_json FROM steps WHERE run_id = ? AND step_key = ?", [runId, stepKey]);
   let merged = patch;
   if (existing?.result_json) {
     try { merged = { ...JSON.parse(existing.result_json), ...patch }; } catch {}
   }
   const resultJson = JSON.stringify(merged);
   if (existing) {
-    db.prepare("UPDATE steps SET status = ?, result_json = ?, finished_at = datetime('now') WHERE id = ?")
-      .run(status, resultJson, existing.id);
+    await db.run("UPDATE steps SET status = ?, result_json = ?, finished_at = ? WHERE id = ?", [status, resultJson, now(), existing.id]);
     return existing.id;
   }
   const id = uuid();
-  db.prepare("INSERT INTO steps (id, run_id, step_key, status, result_json, started_at, finished_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))")
-    .run(id, runId, stepKey, status, resultJson);
+  await db.run(
+    "INSERT INTO steps (id, run_id, step_key, status, result_json, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [id, runId, stepKey, status, resultJson, now(), now()]
+  );
   return id;
 }
 
-function getProjectForRun(runId) {
-  const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(runId);
+async function getProjectForRun(runId) {
+  const run = await db.get("SELECT * FROM runs WHERE id = ?", [runId]);
   if (!run) return null;
-  return db.prepare("SELECT * FROM projects WHERE id = ?").get(run.project_id);
+  return db.get("SELECT * FROM projects WHERE id = ?", [run.project_id]);
 }
 
 // GET /locale-formats — naming format presets for the renamer's format picker
@@ -139,23 +108,23 @@ router.get("/locale-formats", (req, res) => {
 // POST /runs/:runId/steps/cat-import — marks the manual Trados step done,
 // recording which locales the user targeted. No brief text is generated —
 // the actual project setup happens entirely inside Trados, outside this tool.
-router.post("/runs/:runId/steps/cat-import", (req, res) => {
-  const project = getProjectForRun(req.params.runId);
+router.post("/runs/:runId/steps/cat-import", async (req, res) => {
+  const project = await getProjectForRun(req.params.runId);
   if (!project) return res.status(404).json({ error: "Run or project not found" });
 
   const { sourceLocale, locales } = req.body || {};
   const result = { source_locale: sourceLocale || null, locales: locales || [] };
 
-  upsertStep(req.params.runId, "cat_import", "done", JSON.stringify(result));
+  await upsertStep(req.params.runId, "cat_import", "done", JSON.stringify(result));
   res.json({ result });
 });
 
 // POST /runs/:runId/steps/:stepKey/skip — generic skip for any interactive step
-router.post("/runs/:runId/steps/:stepKey/skip", (req, res) => {
-  const project = getProjectForRun(req.params.runId);
+router.post("/runs/:runId/steps/:stepKey/skip", async (req, res) => {
+  const project = await getProjectForRun(req.params.runId);
   if (!project) return res.status(404).json({ error: "Run or project not found" });
 
-  upsertStep(req.params.runId, req.params.stepKey, "skipped", JSON.stringify({ skipped: true, reason: "user_skipped" }));
+  await upsertStep(req.params.runId, req.params.stepKey, "skipped", JSON.stringify({ skipped: true, reason: "user_skipped" }));
   res.json({ ok: true });
 });
 
@@ -177,7 +146,7 @@ router.post("/runs/:runId/steps/renamer/upload-root", stepUpload.single("file"),
 
   // Record it against the step so a later preview/apply without an explicit
   // rootPath still knows where to look.
-  upsertStep(req.params.runId, "renamer", "awaiting_confirmation", JSON.stringify({ root_upload_path: extractPath }));
+  await upsertStep(req.params.runId, "renamer", "awaiting_confirmation", JSON.stringify({ root_upload_path: extractPath }));
   res.json({ path: extractPath });
 });
 
@@ -191,13 +160,13 @@ function resolveSafeRoot(candidate) {
   return resolved.startsWith(storageRoot) ? resolved : null;
 }
 
-function resolveRenamerRoot(req, project) {
+async function resolveRenamerRoot(req, project) {
   const { rootPath, rootSubpath } = req.body || {};
   const safeExplicit = resolveSafeRoot(rootPath);
   if (safeExplicit) return safeExplicit;
 
   // Fall back to whatever was uploaded via upload-root for this step, if any
-  const existing = db.prepare("SELECT result_json FROM steps WHERE run_id = ? AND step_key = 'renamer'").get(req.params.runId);
+  const existing = await db.get("SELECT result_json FROM steps WHERE run_id = ? AND step_key = 'renamer'", [req.params.runId]);
   if (existing?.result_json) {
     try {
       const prev = JSON.parse(existing.result_json);
@@ -210,17 +179,17 @@ function resolveRenamerRoot(req, project) {
 
 // POST /runs/:runId/steps/renamer/preview — dry-run only, never writes to disk
 router.post("/runs/:runId/steps/renamer/preview", async (req, res) => {
-  const project = getProjectForRun(req.params.runId);
+  const project = await getProjectForRun(req.params.runId);
   if (!project) return res.status(404).json({ error: "Run or project not found" });
 
   const { formatId, skipAssets, excludeLocales, sourceLocale, locales } = req.body || {};
-  const rootPath = resolveRenamerRoot(req, project);
+  const rootPath = await resolveRenamerRoot(req, project);
 
   const result = await renamer.run(rootPath, {
     formatId, skipAssets, excludeLocales, sourceLocale, locales, dryRun: true
   });
 
-  upsertStep(req.params.runId, "renamer", result.skipped ? "failed" : "done", JSON.stringify(result));
+  await upsertStep(req.params.runId, "renamer", result.skipped ? "failed" : "done", JSON.stringify(result));
   res.json({ result });
 });
 
@@ -229,40 +198,54 @@ router.post("/runs/:runId/steps/renamer/preview", async (req, res) => {
 // the original project's storage — both server-side, safe to modify).
 // Use GET /projects/:id/download afterward to retrieve as a zip.
 router.post("/runs/:runId/steps/renamer/apply", async (req, res) => {
-  const project = getProjectForRun(req.params.runId);
+  const project = await getProjectForRun(req.params.runId);
   if (!project) return res.status(404).json({ error: "Run or project not found" });
 
   const { formatId, skipAssets, excludeLocales, sourceLocale, locales } = req.body || {};
-  const rootPath = resolveRenamerRoot(req, project);
+  const rootPath = await resolveRenamerRoot(req, project);
 
   const result = await renamer.run(rootPath, {
     formatId, skipAssets, excludeLocales, sourceLocale, locales, dryRun: false
   });
 
-  upsertStep(req.params.runId, "renamer", result.skipped ? "failed" : "done", JSON.stringify(result));
+  await upsertStep(req.params.runId, "renamer", result.skipped ? "failed" : "done", JSON.stringify(result));
   res.json({ result });
 });
 
 // GET /projects/:id/download — zips the project's current storage folder
-// (reflecting any renames already applied) and streams it back.
-router.get("/projects/:id/download", (req, res) => {
-  const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(req.params.id);
+// (reflecting any renames already applied) and streams it back. Works
+// identically for local-disk and S3-backed projects — S3 ones are
+// materialized to a scratch folder first, then cleaned up after.
+router.get("/projects/:id/download", async (req, res) => {
+  const project = await db.get("SELECT * FROM projects WHERE id = ?", [req.params.id]);
   if (!project) return res.status(404).json({ error: "Project not found" });
-  if (!fs.existsSync(project.storage_path)) return res.status(404).json({ error: "Project files not found" });
+
+  let downloadPath = project.storage_path;
+  let scratchDir = null;
+  if (isS3Reference(downloadPath)) {
+    scratchDir = path.join(SCRATCH_ROOT, uuid());
+    await materializeToLocal(downloadPath, scratchDir);
+    downloadPath = scratchDir;
+  }
+
+  if (!fs.existsSync(downloadPath)) return res.status(404).json({ error: "Project files not found" });
 
   res.attachment(`${project.name.replace(/[^a-z0-9_-]/gi, "_")}.zip`);
   const archive = archiver("zip", { zlib: { level: 9 } });
   archive.on("error", (err) => res.status(500).end(err.message));
+  const cleanup = () => { if (scratchDir && fs.existsSync(scratchDir)) fs.rmSync(scratchDir, { recursive: true, force: true }); };
+  res.on("finish", cleanup);
+  res.on("close", cleanup);
   archive.pipe(res);
-  archive.directory(project.storage_path, false);
+  archive.directory(downloadPath, false);
   archive.finalize();
 });
 
 // GET /runs/:runId/steps/renamer/download — zips whichever folder the
 // renamer last operated on (uploaded translated-files folder, or the
 // original project) and streams it back.
-router.get("/runs/:runId/steps/renamer/download", (req, res) => {
-  const stepRow = db.prepare("SELECT result_json FROM steps WHERE run_id = ? AND step_key = 'renamer'").get(req.params.runId);
+router.get("/runs/:runId/steps/renamer/download", async (req, res) => {
+  const stepRow = await db.get("SELECT result_json FROM steps WHERE run_id = ? AND step_key = 'renamer'", [req.params.runId]);
   if (!stepRow?.result_json) return res.status(404).json({ error: "No renamer result for this run yet" });
 
   let rootFolder;
@@ -279,8 +262,8 @@ router.get("/runs/:runId/steps/renamer/download", (req, res) => {
 
 // ── Output encoding & line-ending QA ────────────────────────────────────
 
-function jsonSafeGet(runId, stepKey) {
-  const row = db.prepare("SELECT result_json FROM steps WHERE run_id = ? AND step_key = ?").get(runId, stepKey);
+async function jsonSafeGet(runId, stepKey) {
+  const row = await db.get("SELECT result_json FROM steps WHERE run_id = ? AND step_key = ?", [runId, stepKey]);
   if (!row?.result_json) return null;
   try { return JSON.parse(row.result_json); } catch { return null; }
 }
@@ -288,11 +271,11 @@ function jsonSafeGet(runId, stepKey) {
 // Output folder priority: explicitly uploaded for this step > the
 // renamer's resolved root (files just got renamed, this checks them) >
 // the original uploaded project as a last resort.
-function resolveOutputRoot(runId, project) {
-  const stored = jsonSafeGet(runId, "output_encoding_qa");
+async function resolveOutputRoot(runId, project) {
+  const stored = await jsonSafeGet(runId, "output_encoding_qa");
   if (stored?.output_upload_path && fs.existsSync(stored.output_upload_path)) return stored.output_upload_path;
 
-  const renamerResult = jsonSafeGet(runId, "renamer");
+  const renamerResult = await jsonSafeGet(runId, "renamer");
   if (renamerResult?.root_folder && fs.existsSync(renamerResult.root_folder)) return renamerResult.root_folder;
 
   return project.storage_path;
@@ -300,15 +283,15 @@ function resolveOutputRoot(runId, project) {
 
 // Source folder: explicitly uploaded override > the original project
 // (auto-used by default, per your instruction).
-function resolveSourceRoot(runId, project) {
-  const stored = jsonSafeGet(runId, "output_encoding_qa");
+async function resolveSourceRoot(runId, project) {
+  const stored = await jsonSafeGet(runId, "output_encoding_qa");
   if (stored?.source_upload_path && fs.existsSync(stored.source_upload_path)) return stored.source_upload_path;
   return project.storage_path;
 }
 
 // POST /runs/:runId/steps/output-qa/upload-output — choose the folder to check
 router.post("/runs/:runId/steps/output-qa/upload-output", stepUpload.single("file"), async (req, res) => {
-  const project = getProjectForRun(req.params.runId);
+  const project = await getProjectForRun(req.params.runId);
   if (!project) return res.status(404).json({ error: "Run or project not found" });
   if (!req.file) return res.status(400).json({ error: "No file uploaded." });
 
@@ -321,14 +304,14 @@ router.post("/runs/:runId/steps/output-qa/upload-output", stepUpload.single("fil
     fs.unlinkSync(req.file.path);
   }
 
-  mergeStepResult(req.params.runId, "output_encoding_qa", "awaiting_confirmation", { output_upload_path: extractPath });
+  await mergeStepResult(req.params.runId, "output_encoding_qa", "awaiting_confirmation", { output_upload_path: extractPath });
   res.json({ path: extractPath });
 });
 
 // POST /runs/:runId/steps/output-qa/upload-source — optional override for the
 // comparison baseline; without this, the original project is used automatically.
 router.post("/runs/:runId/steps/output-qa/upload-source", stepUpload.single("file"), async (req, res) => {
-  const project = getProjectForRun(req.params.runId);
+  const project = await getProjectForRun(req.params.runId);
   if (!project) return res.status(404).json({ error: "Run or project not found" });
   if (!req.file) return res.status(400).json({ error: "No file uploaded." });
 
@@ -341,29 +324,29 @@ router.post("/runs/:runId/steps/output-qa/upload-source", stepUpload.single("fil
     fs.unlinkSync(req.file.path);
   }
 
-  mergeStepResult(req.params.runId, "output_encoding_qa", "awaiting_confirmation", { source_upload_path: extractPath });
+  await mergeStepResult(req.params.runId, "output_encoding_qa", "awaiting_confirmation", { source_upload_path: extractPath });
   res.json({ path: extractPath });
 });
 
 // POST /runs/:runId/steps/output-qa/run — runs the actual comparison
 router.post("/runs/:runId/steps/output-qa/run", async (req, res) => {
-  const project = getProjectForRun(req.params.runId);
+  const project = await getProjectForRun(req.params.runId);
   if (!project) return res.status(404).json({ error: "Run or project not found" });
 
-  const outputFolder = resolveOutputRoot(req.params.runId, project);
-  const sourceFolder = resolveSourceRoot(req.params.runId, project);
+  const outputFolder = await resolveOutputRoot(req.params.runId, project);
+  const sourceFolder = await resolveSourceRoot(req.params.runId, project);
 
   const result = await outputEncodingQA.run(outputFolder, sourceFolder);
 
-  mergeStepResult(req.params.runId, "output_encoding_qa", result.skipped ? "failed" : "done", result);
+  await mergeStepResult(req.params.runId, "output_encoding_qa", result.skipped ? "failed" : "done", result);
   res.json({ result });
 });
 
 // GET /runs/:runId/steps/output-qa/download — zips whatever folder was
 // actually checked, so it lines up with the paths referenced in a
 // generated Rainbow .rnb project.
-router.get("/runs/:runId/steps/output-qa/download", (req, res) => {
-  const stored = jsonSafeGet(req.params.runId, "output_encoding_qa");
+router.get("/runs/:runId/steps/output-qa/download", async (req, res) => {
+  const stored = await jsonSafeGet(req.params.runId, "output_encoding_qa");
   const outputFolder = stored?.output_folder;
   if (!outputFolder || !fs.existsSync(outputFolder)) return res.status(404).json({ error: "No output folder found — run the QA check first." });
 
@@ -381,7 +364,7 @@ router.get("/runs/:runId/steps/output-qa/download", (req, res) => {
 // output QA step and generates a Rainbow .rnb referencing wherever the
 // user says they'll extract the downloaded output files locally.
 router.post("/runs/:runId/steps/rainbow-fix/generate", async (req, res) => {
-  const qaResult = jsonSafeGet(req.params.runId, "output_encoding_qa");
+  const qaResult = await jsonSafeGet(req.params.runId, "output_encoding_qa");
   if (!qaResult) return res.status(400).json({ error: "Run the output encoding QA step first." });
 
   const errorFiles = (qaResult.issues || []).filter(f => f.issues.some(i => i.severity === "error"));
@@ -389,7 +372,7 @@ router.post("/runs/:runId/steps/rainbow-fix/generate", async (req, res) => {
 
   const result = await rainbowFix.run(errorFiles, targetEncoding, localRoot, sourceLanguage, targetLanguage);
 
-  upsertStep(req.params.runId, "rainbow_fix", result.skipped ? "failed" : "done", JSON.stringify(result));
+  await upsertStep(req.params.runId, "rainbow_fix", result.skipped ? "failed" : "done", JSON.stringify(result));
   res.json({ result });
 });
 
