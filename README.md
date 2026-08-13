@@ -36,7 +36,7 @@ Open **http://localhost:3000** — upload a zip or a folder, and the pipeline ru
 | Normalize filenames | Interactive | Preview + apply a renaming convention to translated files |
 | Output encoding & line-ending QA | Interactive | Compares output against the source baseline |
 | Okapi Rainbow | Auto-detect | Groups error files into 3 fileSets, generates a downloadable `.rnb` |
-| Package delivery | — | *(not yet ported to web — see desktop version)* |
+
 
 Every project can have multiple runs. Run history is kept per project.
 
@@ -119,5 +119,5 @@ Express · SQLite (`better-sqlite3`) or Postgres (`pg`) · BullMQ + Redis (optio
 
 ## Author
 
-**Bünyamin Genç** — Localization Engineering, Hacettepe University
+**Bünyamin Genç** 
 [GitHub](https://github.com/bunyamingenc)
