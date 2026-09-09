@@ -6,6 +6,7 @@ const inventory = require("../steps/inventory");
 const encodingQA = require("../steps/encodingQA");
 const placeholderAnalysis = require("../steps/placeholderAnalysis");
 const { isS3Reference, materializeToLocal } = require("./storage");
+const { notifyWebhooksForRun } = require("./webhooks");
 
 const SCRATCH_ROOT = path.join(__dirname, "../../storage/scratch");
 const now = () => new Date().toISOString();
@@ -64,11 +65,15 @@ async function processRun(runId, project) {
       } catch (err) {
         await db.run("UPDATE steps SET status = 'failed', result_json = ?, finished_at = ? WHERE id = ?", [JSON.stringify({ error: err.message }), now(), step.id]);
         await db.run("UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ?", [now(), runId]);
+        const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:3000";
+        notifyWebhooksForRun(project.id, runId, API_BASE_URL).catch((e) => console.error(`[webhooks] notify failed for run ${runId}:`, e.message));
         return;
       }
     }
 
     await db.run("UPDATE runs SET status = 'done', updated_at = ? WHERE id = ?", [now(), runId]);
+    const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:3000";
+    notifyWebhooksForRun(project.id, runId, API_BASE_URL).catch((e) => console.error(`[webhooks] notify failed for run ${runId}:`, e.message));
   } finally {
     // These pipeline steps (inventory/encoding QA/placeholder analysis)
     // are read-only scans — nothing needs to be synced back to S3, so the

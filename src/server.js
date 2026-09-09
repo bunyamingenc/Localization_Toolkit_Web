@@ -2,6 +2,8 @@ const express = require("express");
 const path = require("path");
 const projectRoutes = require("./routes/projects");
 const runRoutes = require("./routes/runs");
+const bulkRoutes = require("./routes/bulk");
+const webhookRoutes = require("./routes/webhooks");
 const { apiKeyAuth } = require("./middleware/apiKeyAuth");
 const { runCleanup } = require("./lib/cleanup");
 
@@ -12,6 +14,8 @@ app.use(express.static(path.join(__dirname, "../public")));
 
 app.use("/projects", projectRoutes);
 app.use("/", runRoutes); // mounts /projects/:projectId/runs and /runs/:id
+app.use("/api/bulk", bulkRoutes);
+app.use("/api", webhookRoutes);
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
