@@ -9,8 +9,8 @@ const { runCleanup } = require("./lib/cleanup");
 
 const app = express();
 app.use(express.json());
-app.use(apiKeyAuth); // no-op unless API_KEY env var is set
-app.use(express.static(path.join(__dirname, "../public")));
+app.use(express.static(path.join(__dirname, "../public"))); // public shell — no key needed
+app.use(apiKeyAuth); // gate everything below
 
 app.use("/projects", projectRoutes);
 app.use("/", runRoutes); // mounts /projects/:projectId/runs and /runs/:id
