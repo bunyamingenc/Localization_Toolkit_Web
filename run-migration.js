@@ -1,34 +1,16 @@
-const db = require('better-sqlite3')('storage/loc-toolkit-api.db');
+const fs = require("fs");
+const path = require("path");
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS webhooks (
-  id TEXT PRIMARY KEY,
-  project_id TEXT,
-  bulk_job_id TEXT,
-  url TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  active INTEGER DEFAULT 1,
-  retry_count INTEGER DEFAULT 0,
-  last_error TEXT
-);
+const file = process.argv[2];
+if (!file) {
+  console.error("Usage: node run-migration.js <path-to-sql-file>");
+  process.exit(1);
+}
 
-CREATE TABLE IF NOT EXISTS bulk_jobs (
-  id TEXT PRIMARY KEY,
-  operation_count INTEGER NOT NULL,
-  status TEXT DEFAULT 'running',
-  created_at TEXT NOT NULL,
-  completed_at TEXT
-);
+const sql = fs.readFileSync(path.resolve(file), "utf8");
+const db = require("better-sqlite3")("storage/loc-toolkit-api.db");
 
-CREATE TABLE IF NOT EXISTS run_metadata (
-  id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  key TEXT NOT NULL,
-  value TEXT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE(run_id, key)
-);
-`);
+db.exec(sql);
 
 const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
-console.log('Migration complete. Tables:', tables.map(t => t.name));
+console.log(`Applied ${path.basename(file)}. Tables:`, tables.map(t => t.name));

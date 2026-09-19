@@ -27,14 +27,17 @@ const WEBHOOK_SIGNATURE_HEADER = "X-Loc-Toolkit-Signature";
 async function registerWebhook(projectId, webhookUrl, options = {}) {
   const id = require("uuid").v4();
   const createdAt = new Date().toISOString();
-  
+  const secret = crypto.randomBytes(32).toString("hex");
+
   await db.run(
-    `INSERT INTO webhooks (id, project_id, url, created_at, active, retry_count)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [id, projectId, webhookUrl, createdAt, 1, 0]
+    `INSERT INTO webhooks (id, project_id, url, created_at, active, retry_count, secret)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [id, projectId, webhookUrl, createdAt, 1, 0, secret]
   );
-  
-  return { id, projectId, webhookUrl, createdAt, active: true };
+
+  // The secret is returned here and never again — the consumer must store it
+  // now to verify signatures on future deliveries.
+  return { id, projectId, webhookUrl, createdAt, active: true, secret };
 }
 
 /**
@@ -57,16 +60,20 @@ async function unregisterWebhook(webhookId) {
 
 /**
  * Sign a payload for webhook delivery.
- * Uses HMAC-SHA256 with the webhook ID as the secret.
- * External system can verify signature matches.
+ * Uses HMAC-SHA256 with the webhook's per-registration secret, handed to the
+ * consumer once at registration time. The webhook ID is NOT usable as a key —
+ * it appears in API responses and management URLs, so signing with it would
+ * let anyone who knows the ID forge a valid signature.
  */
-function signPayload(payload, webhookId) {
+function signPayload(payload, secret) {
+  if (!secret) {
+    throw new Error("Cannot sign webhook payload: no secret for this webhook.");
+  }
   const body = JSON.stringify(payload);
-  const hmac = crypto.createHmac("sha256", webhookId);
+  const hmac = crypto.createHmac("sha256", secret);
   hmac.update(body);
   return hmac.digest("hex");
 }
-
 /**
  * Construct the full webhook payload for a completed run.
  * Includes status, all step results, and download URLs for output files.
@@ -119,7 +126,7 @@ async function deliverWebhook(webhookId, payload, attempt = 1) {
   const webhook = await db.get(`SELECT * FROM webhooks WHERE id = ?`, [webhookId]);
   if (!webhook) return; // webhook was deleted
 
-  const signature = signPayload(payload, webhookId);
+  const signature = signPayload(payload, webhook.secret);
   const body = JSON.stringify(payload);
 
   return new Promise((resolve, reject) => {
